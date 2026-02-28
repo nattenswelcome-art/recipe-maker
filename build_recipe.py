@@ -39,11 +39,12 @@ def parse_docx(docx_path):
             return {"title": "Без названия", "body": ""}
             
         title = paragraphs[0]
-        body = "\r".join(paragraphs[1:]) # В InDesign перевод каретки это \r
+        # Используем литерал \r для JavaScript, чтобы InDesign понял это как перевод каретки
+        body = "\\r".join(paragraphs[1:]) 
         
         # Экранирование кавычек для передачи в JavaScript (ExtendScript)
         title = title.replace('"', '\\"').replace("'", "\\'")
-        body = body.replace('"', '\\"').replace("'", "\\'")
+        body = body.replace('"', '\\"').replace("'", "\\'").replace('\n', '\\n')
         
         return {"title": title, "body": body}
     except Exception as e:
@@ -80,8 +81,10 @@ try {{
             var pStyleName = item.parentStory.paragraphs[0].appliedParagraphStyle.name;
             
             if (pStyleName === "Title" || pStyleName === "Заголовок") {{
+                if (item.locked) item.locked = false;
                 item.contents = "{title}";
             }} else if (pStyleName === "Ingredients" || pStyleName === "Ингредиенты" || pStyleName === "Body") {{
+                if (item.locked) item.locked = false;
                 item.contents = "{body}";
             }}
         }}
@@ -116,6 +119,7 @@ try {{
         }}
         
         if (photoFrame) {{
+            if (photoFrame.locked) photoFrame.locked = false;
             photoFrame.place(imageFile);
             photoFrame.fit(FitOptions.FILL_PROPORTIONALLY);
             photoFrame.fit(FitOptions.CENTER_CONTENT);
@@ -148,6 +152,7 @@ try {{
 }} catch (e) {{
     // В случае ошибки записываем ее в текстовый файл, чтобы питон мог ее прочитать
     var errFile = new File("{BASE_DIR}/indesign_error.txt".replace("\\\\", "/"));
+    errFile.encoding = "UTF-8";
     errFile.open("w");
     errFile.write(e.toString() + "\\nLine: " + e.line);
     errFile.close();
@@ -165,22 +170,23 @@ def run_indesign_script(jsx_path):
         os.remove(err_log)
 
     applescript = f'''
-    tell application "Adobe InDesign 2024" -- или просто "Adobe InDesign"
+    tell application "Adobe InDesign 2026"
         do script POSIX file "{jsx_path}" language javascript
     end tell
     '''
     
     try:
         # Popen позволяет выполнить процесс. osascript -e
-        result = subprocess.run(['osascript', '-e', applescript], capture_output=True, text=True)
+        result = subprocess.run(['osascript', '-e', applescript], capture_output=True)
         
         if result.returncode != 0:
-            print(f"[ERROR] Ошибка выполнения AppleScript (возможно нет прав или не запущен InDesign): {result.stderr}")
+            err_msg = result.stderr.decode('utf-8', 'replace') if result.stderr else ''
+            print(f"[ERROR] Ошибка выполнения AppleScript (возможно нет прав или не запущен InDesign): {err_msg}")
             return False
             
         # Проверяем не оставил ли InDesign лог с ошибкой
         if os.path.exists(err_log):
-            with open(err_log, 'r', encoding='utf-8') as f:
+            with open(err_log, 'r', encoding='utf-8', errors='replace') as f:
                 error_msg = f.read()
             print(f"[InDesign ERROR] Скрипт InDesign завершился с ошибкой:\n{error_msg}")
             return False
