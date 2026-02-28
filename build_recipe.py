@@ -25,6 +25,24 @@ def check_environment():
         return False
     return True
 
+def extract_first_image_from_docx(docx_path, output_dir, base_name):
+    """Извлекает первую найденную картинку из .docx файла."""
+    try:
+        doc = Document(docx_path)
+        for rel in doc.part.rels.values():
+            if "image" in rel.target_ref:
+                img_blob = rel.target_part.blob
+                ext = rel.target_ref.split('.')[-1]
+                if ext.lower() not in ['png', 'jpg', 'jpeg']:
+                    ext = 'jpg' # Фоллбек
+                img_path = os.path.join(output_dir, f"{base_name}_extracted.{ext}")
+                with open(img_path, "wb") as f:
+                    f.write(img_blob)
+                return img_path
+    except Exception as e:
+        print(f"[WARNING] Не удалось извлечь картинку из {docx_path}: {e}")
+    return None
+
 def parse_docx(docx_path):
     """
     Извлекает текст из Word-документа.
@@ -210,7 +228,7 @@ def main():
         filename_base = os.path.splitext(os.path.basename(docx_path))[0]
         print(f"\n[INFO] Обрабатываю рецепт: {filename_base}")
         
-        # Ищем парную картинку (jpg, jpeg, png)
+        # Сначала ищем парную картинку в папке (jpg, jpeg, png)
         image_path = None
         for ext in ['.jpg', '.jpeg', '.png']:
             possible_path = os.path.join(INPUT_DIR, f"{filename_base}{ext}")
@@ -218,8 +236,12 @@ def main():
                 image_path = possible_path
                 break
                 
+        # Если отдельной картинки нет, пытаемся достать из самого .docx
         if not image_path:
-            print(f"[WARNING] Для {filename_base}.docx не найдено фото с таким же именем. Пропуск.")
+            image_path = extract_first_image_from_docx(docx_path, OUTPUT_DIR, filename_base)
+                
+        if not image_path:
+            print(f"[WARNING] Для {filename_base}.docx не найдено фото (ни рядом, ни внутри документа). Пропуск.")
             continue
 
         text_data = parse_docx(docx_path)
