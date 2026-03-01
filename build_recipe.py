@@ -1,9 +1,11 @@
 import os
 import glob
 import subprocess
+import json
 from docx import Document
+import openai
 
-# Пути к папкам (абсолютные или относительные текущего скрипта)
+# --- НАСТРОЙКИ ПУТЕЙ И API ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_DIR = os.path.join(BASE_DIR, 'input')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
@@ -11,6 +13,17 @@ TEMPLATES_DIR = os.path.join(BASE_DIR, 'templates')
 
 TEMPLATE_NAME = 'recipe_template.indd'
 TEMPLATE_PATH = os.path.join(TEMPLATES_DIR, TEMPLATE_NAME)
+
+# API Ключ для работы с AI
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+if not OPENAI_API_KEY:
+    print("[ERROR] Не задан OPENAI_API_KEY в переменных окружения.")
+    print("Выполните команду в терминале перед запуском: export OPENAI_API_KEY='ваш_ключ'")
+    exit(1)
+
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
 
 def check_environment():
     """Проверяет наличие необходимых папок и шаблона."""
@@ -34,7 +47,7 @@ def extract_first_image_from_docx(docx_path, output_dir, base_name):
                 img_blob = rel.target_part.blob
                 ext = rel.target_ref.split('.')[-1]
                 if ext.lower() not in ['png', 'jpg', 'jpeg']:
-                    ext = 'jpg' # Фоллбек
+                    ext = 'jpg'
                 img_path = os.path.join(output_dir, f"{base_name}_extracted.{ext}")
                 with open(img_path, "wb") as f:
                     f.write(img_blob)
@@ -43,90 +56,172 @@ def extract_first_image_from_docx(docx_path, output_dir, base_name):
         print(f"[WARNING] Не удалось извлечь картинку из {docx_path}: {e}")
     return None
 
-def parse_docx(docx_path):
-    """
-    Извлекает текст из Word-документа.
-    Предполагается, что первый абзац — Заголовок (Title), остальное — Ингредиенты/Текст (Body).
-    Также можно усложнить логику, ища определенные стили в Word.
-    """
+def parse_docx_raw(docx_path):
+    """Извлекает весь текст из документа без разбивки, просто сырой строкой."""
     try:
         doc = Document(docx_path)
         paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-        
-        if not paragraphs:
-            return {"title": "Без названия", "body": ""}
-            
-        title = paragraphs[0]
-        # Используем литерал \r для JavaScript, чтобы InDesign понял это как перевод каретки
-        body = "\\r".join(paragraphs[1:]) 
-        
-        # Экранирование кавычек для передачи в JavaScript (ExtendScript)
-        title = title.replace('"', '\\"').replace("'", "\\'")
-        body = body.replace('"', '\\"').replace("'", "\\'").replace('\n', '\\n')
-        
-        return {"title": title, "body": body}
+        return "\n".join(paragraphs)
     except Exception as e:
         print(f"[ERROR] Ошибка чтения {docx_path}: {e}")
         return None
 
-def generate_jsx(recipe_name, text_data, image_path, output_indd, output_pdf):
-    """Генерирует JSX-скрипт для InDesign с зашитыми путями и данными."""
-    title = text_data.get("title", "")
-    body = text_data.get("body", "")
+def extract_template_frames_from_indesign():
+    """Открывает шаблон InDesign и вытаскивает все ID текстовых фреймов и их текущий текст."""
+    print("[INFO] Читаю структуру текстовых фреймов из шаблона InDesign (Идет открытие шаблона, ждите)...")
+    jsx_path = os.path.join(BASE_DIR, "temp_extract.jsx")
+    json_path = os.path.join(BASE_DIR, "frames.json")
     
-    # Экранируем пути для JS (AppleScript иногда ругается на обратные слеши, используем прямые)
     template_js = TEMPLATE_PATH.replace("\\", "/")
-    image_js = image_path.replace("\\", "/")
+    json_js = json_path.replace("\\", "/")
+    
+    jsx_code = f"""
+app.scriptPreferences.userInteractionLevel = UserInteractionLevels.NEVER_INTERACT;
+try {{
+    var templateFile = new File("{template_js}");
+    var doc = app.open(templateFile);
+    
+    var jsonStrs = [];
+    for (var i = 0; i < doc.textFrames.length; i++) {{
+        var rawText = doc.textFrames[i].contents;
+        var cleanText = rawText.replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"').replace(/\\n/g, '\\\\n').replace(/\\r/g, '\\\\n').replace(/\\t/g, ' ');
+        // Берем только первые 400 символов для контекста, чтобы не перегружать AI
+        cleanText = cleanText.substring(0, 400); 
+        jsonStrs.push('{{"id":"' + i + '", "text":"' + cleanText + '"}}');
+    }}
+    
+    var outFile = new File("{json_js}");
+    outFile.encoding = "UTF-8";
+    outFile.open("w");
+    outFile.write("[" + jsonStrs.join(",") + "]");
+    outFile.close();
+    
+    doc.close(SaveOptions.NO);
+}} catch(e) {{
+    var errFile = new File("{BASE_DIR}/indesign_error.txt".replace("\\\\", "/"));
+    errFile.encoding = "UTF-8";
+    errFile.open("w");
+    errFile.write(e.toString() + "\\nLine: " + e.line);
+    errFile.close();
+}} finally {{
+    app.scriptPreferences.userInteractionLevel = UserInteractionLevels.INTERACT_WITH_ALL;
+}}
+"""
+    with open(jsx_path, 'w', encoding='utf-8') as f:
+        f.write(jsx_code)
+        
+    subprocess.run(['osascript', '-e', f'tell application "Adobe InDesign 2026" to do script POSIX file "{jsx_path}" language javascript'], capture_output=True)
+    os.remove(jsx_path)
+    
+    if os.path.exists(json_path):
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        os.remove(json_path)
+        
+        # Фильтруем пустые фреймы
+        data = [item for item in data if item['text'].strip()]
+        return data
+    else:
+        print("[ERROR] Не удалось получить структуру фреймов. Возможно InDesign закрыт или выдал ошибку.")
+        return None
+
+def parse_with_ai(frames_data, raw_recipe_text):
+    """Интеграция с OpenAI для маппинга текста нового рецепта во фреймы шаблона."""
+    print("[INFO] Отправляю задачу нейросети OpenAI (Идет интеллектуальный парсинг)...")
+    
+    frames_context = json.dumps(frames_data, ensure_ascii=False, indent=2)
+    
+    prompt = f"""
+Ты — профессиональный верстальщик-редактор. Тебе дают шаблон дизайна, где каждый текстовый фрейм имеет свой строковый ID и свой текущий текст (текст прошлого рецепта). 
+Также тебе дают неструктурированный текст нового рецепта.
+
+Твоя задача — расставить части нового рецепта по фреймам шаблона. 
+Пойми, где в шаблоне лежали старые ингредиенты (или утварь), и положи в этот ID новые ингредиенты. 
+Где лежало старое количество минут — положи новые минуты.
+Где старый заголовок блюда — новый заголовок. И так далее.
+Оставь без изменений те фреймы, которые являются общими статичными надписями (например, ссылки на соцсети, "Есть вопросы по рецепту?", "Приготовить в 1-5 день", номера, стрелочки и пустые символы).
+
+Структура шаблона (текущие фреймы JSON):
+{frames_context}
+
+Текст НОВОГО рецепта:
+{raw_recipe_text}
+
+ВЕРНИ СТРОГО JSON-СЛОВАРЬ (ключ: ID фрейма, значение: новый текст). 
+Если фрейм не надо менять, верни старый текст (копию).
+Никакого markdown, никакого введения, только чистый JSON-массив объекта, где ключи - строки-числа.
+Пример ответа: {{"0": "Срок годности", "1": "Шашлычок", "2": "Томаты.."}}
+"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You output only minified raw JSON object. Use double quotes. No \u0060\u0060\u0060json block around it."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            timeout=45
+        )
+        result_text = response.choices[0].message.content.strip()
+        
+        # Очистка markdown если есть
+        if result_text.startswith("```json"):
+            result_text = result_text[7:]
+        if result_text.startswith("```"):
+            result_text = result_text[3:]
+        if result_text.endswith("```"):
+            result_text = result_text[:-3]
+            
+        return json.loads(result_text.strip())
+    except Exception as e:
+        print(f"[ERROR] Ошибка при парсинге через OpenAI API: {e}")
+        return None
+
+def generate_write_jsx(filename_base, mapped_data, image_path, output_indd, output_pdf):
+    """Генерирует финальный скрипт, который вставляет новые тексты по ID фреймов."""
+    
+    template_js = TEMPLATE_PATH.replace("\\", "/")
+    image_js = image_path.replace("\\", "/") if image_path else ""
     output_indd_js = output_indd.replace("\\", "/")
     output_pdf_js = output_pdf.replace("\\", "/")
 
-    jsx_code = f"""
-// --- Auto-generated InDesign Script ---
-app.scriptPreferences.userInteractionLevel = UserInteractionLevels.NEVER_INTERACT;
+    # Формируем JS-объект для обновления фреймов. Мы должны заменить \n на \r для InDesign
+    # И экранировать кавычки
+    updates_js_parts = []
+    for frame_id, new_text in mapped_data.items():
+        # InDesign использует \r
+        safe_text = str(new_text).replace('"', '\\"').replace("'", "\\'").replace('\n', '\\r').replace('\r\r', '\\r')
+        updates_js_parts.append(f'"{frame_id}": "{safe_text}"')
+    
+    updates_json_str = "{" + ", ".join(updates_js_parts) + "}"
 
+    jsx_code = f"""
+app.scriptPreferences.userInteractionLevel = UserInteractionLevels.NEVER_INTERACT;
 try {{
     var templateFile = new File("{template_js}");
-    if (!templateFile.exists) throw new Error("Шаблон не найден: " + templateFile.fsName);
-    
     var doc = app.open(templateFile);
     
-    // 1. Вставка текста по Paragraph Styles
-    // Мы ищем текстовые фреймы, заглядываем в их первый абзац и проверяем примененный стиль.
-    var textFrames = doc.allPageItems;
-    for (var i = 0; i < textFrames.length; i++) {{
-        var item = textFrames[i];
-        if (item instanceof TextFrame && item.parentStory.paragraphs.length > 0) {{
-            var pStyleName = item.parentStory.paragraphs[0].appliedParagraphStyle.name;
-            
-            if (pStyleName === "Title" || pStyleName === "Заголовок") {{
-                if (item.locked) item.locked = false;
-                item.contents = "{title}";
-            }} else if (pStyleName === "Ingredients" || pStyleName === "Ингредиенты" || pStyleName === "Body") {{
-                if (item.locked) item.locked = false;
-                item.contents = "{body}";
-            }}
+    var updates = {updates_json_str};
+    
+    // 1. Обновление текстов
+    for (var key in updates) {{
+        var idx = parseInt(key);
+        if (idx >= 0 && idx < doc.textFrames.length) {{
+            var frame = doc.textFrames[idx];
+            if (frame.locked) frame.locked = false;
+            frame.contents = updates[key];
         }}
     }}
     
-    // 2. Вставка картинки (ищем по Script Label 'Photo' или берем самый большой Rectangle)
-    var imageFile = new File("{image_js}");
-    if (imageFile.exists) {{
-        var photoFrame = null;
-        
-        // Пытаемся найти по ярлыку (Script Label)
-        for (var i = 0; i < doc.allPageItems.length; i++) {{
-            if (doc.allPageItems[i].label === "Photo" && doc.allPageItems[i] instanceof Rectangle) {{
-                photoFrame = doc.allPageItems[i];
-                break;
-            }}
-        }}
-        
-        // Если не нашли по ярлыку, берем самый большой Rectangle на документе
-        if (!photoFrame) {{
+    // 2. Вставка картинки (берем самый большой Rectangle)
+    var imageFileStr = "{image_js}";
+    if (imageFileStr !== "") {{
+        var imageFile = new File(imageFileStr);
+        if (imageFile.exists) {{
+            var photoFrame = null;
             var maxArea = 0;
             for (var i = 0; i < doc.rectangles.length; i++) {{
                 var rect = doc.rectangles[i];
-                // bounds: [y1, x1, y2, x2]
                 var b = rect.geometricBounds;
                 var area = (b[2] - b[0]) * (b[3] - b[1]);
                 if (area > maxArea) {{
@@ -134,41 +229,30 @@ try {{
                     photoFrame = rect;
                 }}
             }}
-        }}
-        
-        if (photoFrame) {{
-            if (photoFrame.locked) photoFrame.locked = false;
-            photoFrame.place(imageFile);
-            photoFrame.fit(FitOptions.FILL_PROPORTIONALLY);
-            photoFrame.fit(FitOptions.CENTER_CONTENT);
+            
+            if (photoFrame) {{
+                if (photoFrame.locked) photoFrame.locked = false;
+                photoFrame.place(imageFile);
+                photoFrame.fit(FitOptions.FILL_PROPORTIONALLY);
+                photoFrame.fit(FitOptions.CENTER_CONTENT);
+            }}
         }}
     }}
     
-    // Проверка на Overset Text
-    for (var i = 0; i < doc.textFrames.length; i++) {{
-        if (doc.textFrames[i].overflows) {{
-            // В идеале можно авто-уменьшить шрифт, но для начала просто выведем warning.
-            // Добавим label, чтобы потом считать его из питона, но проще просто сделать fit.
-            // doc.textFrames[i].fit(FitOptions.FRAME_TO_CONTENT); // Может сломать верстку
-        }}
-    }}
-
     // 3. Сохранение файла
     var outInddFile = new File("{output_indd_js}");
     doc.save(outInddFile);
     
     // 4. Экспорт в PDF
     var outPdfFile = new File("{output_pdf_js}");
-    var pdfPreset = app.pdfExportPresets.item("[High Quality Print]"); // Пресет по умолчанию
+    var pdfPreset = app.pdfExportPresets.item("[High Quality Print]");
     if (!pdfPreset.isValid) {{
-        pdfPreset = app.pdfExportPresets.firstItem(); // Берем первый если нет HQ Print
+        pdfPreset = app.pdfExportPresets.firstItem();
     }}
     doc.exportFile(ExportFormat.PDF_TYPE, outPdfFile, false, pdfPreset);
     
     doc.close(SaveOptions.NO);
-
 }} catch (e) {{
-    // В случае ошибки записываем ее в текстовый файл, чтобы питон мог ее прочитать
     var errFile = new File("{BASE_DIR}/indesign_error.txt".replace("\\\\", "/"));
     errFile.encoding = "UTF-8";
     errFile.open("w");
@@ -181,8 +265,7 @@ try {{
     return jsx_code
 
 def run_indesign_script(jsx_path):
-    """Запускает JSX скрипт через osascript (AppleScript)."""
-    # Удаляем старый лог ошибок, если был
+    """Запускает сгенерированный JSX скрипт через osascript."""
     err_log = os.path.join(BASE_DIR, 'indesign_error.txt')
     if os.path.exists(err_log):
         os.remove(err_log)
@@ -194,19 +277,16 @@ def run_indesign_script(jsx_path):
     '''
     
     try:
-        # Popen позволяет выполнить процесс. osascript -e
         result = subprocess.run(['osascript', '-e', applescript], capture_output=True)
-        
         if result.returncode != 0:
             err_msg = result.stderr.decode('utf-8', 'replace') if result.stderr else ''
-            print(f"[ERROR] Ошибка выполнения AppleScript (возможно нет прав или не запущен InDesign): {err_msg}")
+            print(f"[ERROR] Ошибка выполнения AppleScript: {err_msg}")
             return False
             
-        # Проверяем не оставил ли InDesign лог с ошибкой
         if os.path.exists(err_log):
             with open(err_log, 'r', encoding='utf-8', errors='replace') as f:
                 error_msg = f.read()
-            print(f"[InDesign ERROR] Скрипт InDesign завершился с ошибкой:\n{error_msg}")
+            print(f"[InDesign ERROR] Скрипт InDesign упал:\n{error_msg}")
             return False
             
         return True
@@ -214,11 +294,16 @@ def run_indesign_script(jsx_path):
         print(f"[ERROR] Сбой запуска osascript: {e}")
         return False
 
+
 def main():
     if not check_environment():
         return
 
-    # Ищем все DOCX в папке input
+    # Извлекаем структуру текущего шаблона из InDesign 
+    template_frames = extract_template_frames_from_indesign()
+    if not template_frames:
+        return
+
     docx_files = glob.glob(os.path.join(INPUT_DIR, '*.docx'))
     if not docx_files:
         print("[INFO] В папке input/ нет .docx файлов для обработки.")
@@ -228,7 +313,18 @@ def main():
         filename_base = os.path.splitext(os.path.basename(docx_path))[0]
         print(f"\n[INFO] Обрабатываю рецепт: {filename_base}")
         
-        # Сначала ищем парную картинку в папке (jpg, jpeg, png)
+        # Получаем сырой текст из ворда
+        raw_text = parse_docx_raw(docx_path)
+        if not raw_text:
+            continue
+            
+        # Умный маппинг текста во фреймы (МАГИЯ ИИ)
+        mapped_data = parse_with_ai(template_frames, raw_text)
+        if not mapped_data:
+            print(f"[ERROR] ИИ не смог распарсить Rezept {filename_base}. Пропуск.")
+            continue
+        
+        # Добываем картинку (сначала отдельный файл, затем из docx)
         image_path = None
         for ext in ['.jpg', '.jpeg', '.png']:
             possible_path = os.path.join(INPUT_DIR, f"{filename_base}{ext}")
@@ -236,34 +332,25 @@ def main():
                 image_path = possible_path
                 break
                 
-        # Если отдельной картинки нет, пытаемся достать из самого .docx
         if not image_path:
             image_path = extract_first_image_from_docx(docx_path, OUTPUT_DIR, filename_base)
-                
-        if not image_path:
-            print(f"[WARNING] Для {filename_base}.docx не найдено фото (ни рядом, ни внутри документа). Пропуск.")
-            continue
-
-        text_data = parse_docx(docx_path)
-        if not text_data:
-            continue
             
+        # Генерация и запуск финального скрипта
         output_indd = os.path.join(OUTPUT_DIR, f"{filename_base}.indd")
         output_pdf = os.path.join(OUTPUT_DIR, f"{filename_base}.pdf")
         
-        jsx_code = generate_jsx(filename_base, text_data, image_path, output_indd, output_pdf)
+        jsx_code = generate_write_jsx(filename_base, mapped_data, image_path, output_indd, output_pdf)
         jsx_file_path = os.path.join(BASE_DIR, f"temp_{filename_base}.jsx")
         
         with open(jsx_file_path, 'w', encoding='utf-8') as f:
             f.write(jsx_code)
             
-        print(f"[INFO] Запускаю InDesign для генерации {filename_base}...")
+        print(f"[INFO] Запускаю InDesign для вставки данных и экспорта...")
         success = run_indesign_script(jsx_file_path)
         
         if success:
             print(f"[SUCCESS] Готово! Сохранено: output/{filename_base}.pdf")
         
-        # Удаляем временный js скрипт
         if os.path.exists(jsx_file_path):
             os.remove(jsx_file_path)
 
