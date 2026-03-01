@@ -79,7 +79,7 @@ def extract_template_frames_from_indesign():
 app.scriptPreferences.userInteractionLevel = UserInteractionLevels.NEVER_INTERACT;
 try {{
     var templateFile = new File("{template_js}");
-    var doc = app.open(templateFile);
+    var doc = app.open(templateFile, false);
     
     var jsonStrs = [];
     for (var i = 0; i < doc.textFrames.length; i++) {{
@@ -152,16 +152,21 @@ def parse_with_ai(frames_data, raw_recipe_text, few_shot_data):
 1. Ингредиенты [СУПЕР КРИТИЧНО]: 
    - В шаблоне сейчас забиты старые ингредиенты: "Филе куриное", "Бекон", "Шпажки", "Томаты протертые", "Птитим" и т.д.
    - ТВОЯ КРИТИЧЕСКАЯ ЗАДАЧА — ПОЛНОСТЬЮ УНИЧТОЖИТЬ ИХ. Ты НЕ ИМЕЕШЬ ПРАВА возвращать строку, содержащую "Филе куриное" или "Бекон", если их нет в НОВОМ рецепте.
-   - Найди ВСЕ фреймы, где лежат ингредиенты (их минимум 2 колонки).
-   - Раздели новый список ингредиентов пополам и заполни обе колонки. 
-   - Если новые ингредиенты влезли в одну колонку, для второй колонки верни пустую строку "", чтобы стереть старый текст "Филе куриное / Бекон". НИКОГДА не возвращай старый текст ингредиентов!
-2. Нумерация шагов: InDesign автоматически ставит номер на каждый абзац (перенос строки).
+   - Раздели список ингредиентов пополам и заполни обе колонки. Если влезли в одну — для второй верни пустую строку "".
+   - [ВЫРАВНИВАНИЕ]: Ингредиенты должны быть выровнены по правому краю с точками! НО НЕ пиши точки сам! Обязательно вставляй СИМВОЛ ТАБУЛЯЦИИ `\\t` между названием ингредиента и весом. Пример: `Картофель мини\\t400 г`. InDesign сам растянет точки до конца строки благодаря табуляции. 
+   - [МЕЖСТРОЧНЫЕ ОТСТУПЫ]: КАТЕГОРИЧЕСКИ запрещено делать переносы строки (`\\n`) внутри одного параграфа/ингредиента, даже если он длинный. Напиши длинный ингредиент в одну строку: `Сливочное масло с беконом\\t40 г`. Несоблюдение этого сломает интервалы!
+2. КБЖУ:
+   - В блоке КБЖУ (Калорийность) между словом и цифрой обязательно ставь точки, чтобы выровнять значения. Пример: `Белки..........................7,5\\nЖиры.............................5.0`
+3. Шаги приготовления и нумерация:
    - ОДИН перенос строки `\\n` = ОДИН новый номер шага!
-   - КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ делать пустые строки (`\\n\\n`) между шагами — появится пустая строка с лишним номером.
+   - КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ делать пустые строки (`\\n\\n`) между шагами.
    - КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ делать перенос строки ВНУТРИ одного шага.
    - Не пиши сами цифры шагов ("1.", "2.") вручную, пиши только сам текст.
-   - У каждого шага в конце ставится ОДИН перенос строки `\\n`, чтобы отделить его от следующего шага.
-3. Оставь без изменений те фреймы, которые являются общими статичными надписями (например, ссылки на соцсети, "Есть вопросы по рецепту?", "Приготовить в 1-5 день", номера, стрелочки и пустые символы).
+   - У каждого шага в конце ставится ОДИН перенос строки `\\n`.
+4. Номер сборки заказа: Обязательно найди в DOCX одиночную цифру сборки (например, "7") и подставь её в соответствующий фрейм.
+5. ЗАПРЕТЫ:
+   - КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ писать слово "РЕЦЕПТ" или "Шаги" перед началом шагов.
+   - ДЛЯ СПИСКА ПОСУДЫ/ИНВЕНТАРЯ: Копируй весь инвентарь (кастрюли, миски, сковорода и т.д.) из DOCX абсолютно ЦЕЛИКОМ, не пропуская ни единого слова! Если список длинный — копируй его полностью, как есть в DOCX. Не отрезай слова. Оставляй общие статичные фреймы (соцсети) без изменений.
 
 {few_shot_context}
 
@@ -174,7 +179,8 @@ def parse_with_ai(frames_data, raw_recipe_text, few_shot_data):
 
 ВЕРНИ СТРОГО JSON-СЛОВАРЬ (ключ: ID фрейма, значение: новый текст). 
 Если фрейм является СТАТИЧНОЙ НАДПИСЬЮ и его не надо менять, верни старый текст (копию). 
-ВНИМАНИЕ: Фреймы с "Филе куриное", "Бекон", "Томаты" НЕ ЯВЛЯЮТСЯ статичными, их нужно полностью перезаписать или вернуть пустую строку ""!
+ВНИМАНИЕ 1: Вторая колонка ингредиентов НЕ ЯВЛЯЕТСЯ статичной! Если все продукты влезли в одну колонку, ТЫ ОБЯЗАН обнулить вторую (вернуть `""`).
+ВНИМАНИЕ 2: НЕ ПУТАЙ ИНГРЕДИЕНТЫ И ИНВЕНТАРЬ ПРИ ЗАПОЛНЕНИИ КОЛОНОК! Ингредиенты — это продукты (мясо, овощи). А инвентарь (кастрюли, сковороды) пиши СТРОГО в самый нижний фрейм (где сейчас "Кастрюля, дуршлаг..."). Никогда не пиши кастрюли в колонку с ингредиентами!
 
 Никакого markdown, никакого введения, только чистый JSON-массив объекта, где ключи - строки-числа.
 Пример ответа: {{"0": "Срок годности", "1": "Шашлычок", "2": "Томаты.."}}
@@ -214,8 +220,22 @@ def generate_write_jsx(filename_base, mapped_data, image_path, output_indd, outp
 
     # Формируем JS-объект для обновления фреймов. Мы должны заменить \n на \r для InDesign
     # И экранировать кавычки
+    import re
     updates_js_parts = []
     for frame_id, new_text in mapped_data.items():
+        if isinstance(new_text, str):
+            clean_text = new_text.strip()
+            # Убираем случайное слово РЕЦЕПТ в начале текстового блока (если ИИ сглючил)
+            clean_text = re.sub(r'(?i)^(рецепт|шаги)[:\n\s]*', '', clean_text).strip()
+            # Заменяем двойные переносы на одинарные, чтобы не было пустых строк с номером
+            clean_text = re.sub(r'\n{2,}', '\n', clean_text)
+            
+            # ЖЕСТКАЯ ЗАМЕНА ТОЧЕК НА ТАБУЛЯЦИЮ (Для красивого центрирования в InDesign)
+            # Даже если ИИ накидал точек, Python заменит их на \t
+            clean_text = re.sub(r'\s*\.{2,}\s*', '\t', clean_text)
+            
+            new_text = clean_text + "\n" if clean_text else ""
+            
         # InDesign использует \r
         safe_text = str(new_text).replace('"', '\\"').replace("'", "\\'").replace('\n', '\\r').replace('\r\r', '\\r')
         updates_js_parts.append(f'"{frame_id}": "{safe_text}"')
@@ -226,7 +246,7 @@ def generate_write_jsx(filename_base, mapped_data, image_path, output_indd, outp
 app.scriptPreferences.userInteractionLevel = UserInteractionLevels.NEVER_INTERACT;
 try {{
     var templateFile = new File("{template_js}");
-    var doc = app.open(templateFile);
+    var doc = app.open(templateFile, false);
     
     var updates = {updates_json_str};
     
@@ -240,20 +260,46 @@ try {{
         }}
     }}
     
-    // 2. Вставка картинки (берем самый большой Rectangle)
+    // 2. Вставка картинки (берем самый большой Rectangle, а остальные большие - удаляем, чтобы не было дублей старых фото)
     var imageFileStr = "{image_js}";
     if (imageFileStr !== "") {{
         var imageFile = new File(imageFileStr);
         if (imageFile.exists) {{
             var photoFrame = null;
             var maxArea = 0;
+            var allLargeRects = [];
+            
             for (var i = 0; i < doc.rectangles.length; i++) {{
                 var rect = doc.rectangles[i];
                 var b = rect.geometricBounds;
                 var area = (b[2] - b[0]) * (b[3] - b[1]);
-                if (area > maxArea) {{
+                if (area > 10000) {{
+                    allLargeRects.push(rect);
+                }}
+                
+                // Приоритет фреймам, внутри которых УЖЕ ЕСТЬ картинка (template placeholder)
+                try {{
+                    if (rect.graphics.length > 0 && area > 10000) {{
+                        photoFrame = rect;
+                    }}
+                }} catch(e) {{}}
+                
+                // Фолбэк на просто самый большой, если картинок вообще нет
+                if (!photoFrame && area > maxArea) {{
                     maxArea = area;
                     photoFrame = rect;
+                }}
+            }}
+            
+            // Удаляем все остальные большие фреймы (подложки со старыми фото), чтобы они не торчали снизу
+            for (var k = 0; k < allLargeRects.length; k++) {{
+                if (allLargeRects[k] !== photoFrame) {{
+                    try {{
+                        if (allLargeRects[k].graphics.length > 0) {{
+                            if (allLargeRects[k].locked) allLargeRects[k].locked = false;
+                            allLargeRects[k].remove();
+                        }}
+                    }} catch(e) {{}}
                 }}
             }}
             
@@ -262,7 +308,42 @@ try {{
                 photoFrame.place(imageFile);
                 photoFrame.fit(FitOptions.FILL_PROPORTIONALLY);
                 photoFrame.fit(FitOptions.CENTER_CONTENT);
+                
+                // --- СМАРТ-ОБРЕЗКА ФОТО (ДЛЯ 5мм ОТСТУПА ОТ ЗАГОЛОВКА) ---
+                var titleTopY = 1000;
+                var maxTitleSize = 0;
+                for (var j = 0; j < doc.textFrames.length; j++) {{
+                    var tFrame = doc.textFrames[j];
+                    var tb = tFrame.geometricBounds;
+                    // Ищем фрейм слева (X1 < 50), сверху/посередине (Y1 > 40 && Y1 < 150)
+                    if (tb[1] < 50 && tb[0] > 40 && tb[0] < 150) {{
+                        var pSize = 0;
+                        try {{
+                            if (tFrame.paragraphs.length > 0) {{
+                                pSize = tFrame.paragraphs[0].pointSize;
+                            }}
+                        }} catch(e) {{}}
+                        
+                        // Заголовок - это самый крупный текст в этой зоне (обычно > 18pt)
+                        if (pSize > maxTitleSize && pSize >= 15) {{
+                            maxTitleSize = pSize;
+                            titleTopY = tb[0];
+                        }}
+                    }}
+                }}
+                
+                if (titleTopY < 1000) {{
+                    var newBottom = titleTopY - 5; // Даем 5 мм отступа
+                    var pb = photoFrame.geometricBounds;
+                    if (newBottom > pb[0] + 30) {{ // Не сжимаем до 0 (оставляем хотя бы 30мм высоты)
+                        photoFrame.geometricBounds = [pb[0], pb[1], newBottom, pb[3]];
+                        photoFrame.fit(FitOptions.FILL_PROPORTIONALLY);
+                        photoFrame.fit(FitOptions.CENTER_CONTENT);
+                    }}
+                }}
+                // ------------------------------------------------
             }}
+
         }}
     }}
     
