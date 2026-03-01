@@ -125,22 +125,34 @@ try {{
         print("[ERROR] Не удалось получить структуру фреймов. Возможно InDesign закрыт или выдал ошибку.")
         return None
 
-def parse_with_ai(frames_data, raw_recipe_text):
-    """Интеграция с OpenAI для маппинга текста нового рецепта во фреймы шаблона."""
-    print("[INFO] Отправляю задачу нейросети OpenAI (Идет интеллектуальный парсинг)...")
+def parse_with_ai(frames_data, raw_recipe_text, few_shot_data):
+    """Интеграция с OpenAI для маппинга текста нового рецепта во фреймы шаблона (Few-Shot)."""
+    print("[INFO] Отправляю задачу нейросети OpenAI (Идет интеллектуальный парсинг с Базой Знаний)...")
     
     frames_context = json.dumps(frames_data, ensure_ascii=False, indent=2)
+    few_shot_context = ""
     
+    if few_shot_data:
+        # Берем до 5 примеров, чтобы не переполнять токенный лимит
+        examples = few_shot_data[:5]
+        few_shot_context = "ВОТ ПРИМЕРЫ ИЗ ТВОЕЙ БАЗЫ ЗНАНИЙ (Как профессиональный верстальщик раскладывал тексты раньше):\n\n"
+        for i, example in enumerate(examples):
+            docx_sample = example.get("source_docx", "")[:800] # Берем срез, чтобы не лопнул промпт
+            indd_sample = json.dumps(example.get("target_frames", {}), ensure_ascii=False)
+            few_shot_context += f"--- ПРИМЕР {i+1} ---\nСЫРОЙ ТЕКСТ:\n{docx_sample}...\n\nРЕЗУЛЬТАТ (JSON ФРЕЙМОВ):\n{indd_sample}\n\n"
+            
     prompt = f"""
 Ты — профессиональный верстальщик-редактор. Тебе дают шаблон дизайна, где каждый текстовый фрейм имеет свой строковый ID и свой текущий текст (текст прошлого рецепта). 
 Также тебе дают неструктурированный текст нового рецепта.
 
-Твоя задача — расставить части нового рецепта по фреймам шаблона. 
-Пойми, где в шаблоне лежали старые ингредиенты (или утварь), и положи в этот ID новые ингредиенты. 
-Где лежало старое количество минут — положи новые минуты.
-Где старый заголовок блюда — новый заголовок. И так далее.
+Твоя задача — расставить части нового рецепта по фреймам шаблона с 100% хирургической точностью.
+Никакой отсебятины. Копируй символ в символ.
+
 Оставь без изменений те фреймы, которые являются общими статичными надписями (например, ссылки на соцсети, "Есть вопросы по рецепту?", "Приготовить в 1-5 день", номера, стрелочки и пустые символы).
 
+{few_shot_context}
+
+--- ТЕПЕРЬ ТВОЯ ОЧЕРЕДЬ ---
 Структура шаблона (текущие фреймы JSON):
 {frames_context}
 
@@ -299,6 +311,17 @@ def main():
     if not check_environment():
         return
 
+    # Загружаем базу знаний Few-Shot если она есть
+    few_shot_data = None
+    dataset_path = os.path.join(BASE_DIR, 'training_dataset.json')
+    if os.path.exists(dataset_path):
+        try:
+            with open(dataset_path, 'r', encoding='utf-8') as f:
+                few_shot_data = json.load(f)
+            print(f"[INFO] Успешно загружена База Знаний ({len(few_shot_data)} примеров).")
+        except Exception as e:
+            print(f"[WARNING] Не удалось прочитать базу знаний: {e}")
+
     # Извлекаем структуру текущего шаблона из InDesign 
     template_frames = extract_template_frames_from_indesign()
     if not template_frames:
@@ -319,9 +342,9 @@ def main():
             continue
             
         # Умный маппинг текста во фреймы (МАГИЯ ИИ)
-        mapped_data = parse_with_ai(template_frames, raw_text)
+        mapped_data = parse_with_ai(template_frames, raw_text, few_shot_data)
         if not mapped_data:
-            print(f"[ERROR] ИИ не смог распарсить Rezept {filename_base}. Пропуск.")
+            print(f"[ERROR] ИИ не смог распарсить рецепт {filename_base}. Пропуск.")
             continue
         
         # Добываем картинку (сначала отдельный файл, затем из docx)
